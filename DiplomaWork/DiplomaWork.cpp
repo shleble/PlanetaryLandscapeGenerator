@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <random>
 #include <fstream>
+#include <chrono> // For timing
 
 // Vector structure for 3D coordinates
 struct Vec3 {
@@ -244,9 +245,15 @@ public:
     // Generate heightmaps with uplift and erosion
     void generateHeightmaps() {
         generateInitialMaps();
+        
+        std::cout << "Starting Analytical Erosion..." << std::endl;
+        auto start = std::chrono::high_resolution_clock::now();
         for (int face = 0; face < 6; ++face) {
             applyAnalyticalErosion(face);
         }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        std::cout << "Analysis Erosion completed in: " << elapsed.count() << " seconds." << std::endl;
     }
 
     // Voxelization for Marching Cubes
@@ -401,7 +408,9 @@ public:
 int main() {
     setlocale(LC_NUMERIC, "French_Canada.1252");
     try {
-        PlanetParams params = {9.81, 100.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        PlanetParams params = {9.81, 1000.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
         PlanetaryLandscape planet(params);
         planet.generateHeightmaps();
         
@@ -409,10 +418,19 @@ int main() {
         PlanetaryExporter::printHeightmapSample(planet.getHeightmaps(), planet.getResolution());
         PlanetaryExporter::saveHeightmapToCSV(planet.getHeightmaps(), planet.getResolution());
         
+        std::cout << "Generating Base Terrain SDF..." << std::endl;
         planet.generateBaseTerrain();
-        // planet.generateMesh(); // Removed redundancy
         
+        std::cout << "Exporting Mesh..." << std::endl;
+        auto export_start = std::chrono::high_resolution_clock::now();
         PlanetaryExporter::exportMesh(planet.getGrid(), "planet2.obj");
+        auto export_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> export_elapsed = export_end - export_start;
+        std::cout << "Mesh Generation and Export completed in: " << export_elapsed.count() << " seconds." << std::endl;
+
+        auto total_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> total_elapsed = total_end - total_start;
+        std::cout << "TOTAL Execution Time: " << total_elapsed.count() << " seconds." << std::endl;
     }
     catch (...) {
         std::cout << "something is wrong";
