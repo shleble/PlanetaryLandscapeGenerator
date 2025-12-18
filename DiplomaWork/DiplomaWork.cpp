@@ -74,7 +74,8 @@ public:
         // Improve noise for planetary scale
         noise.SetFractalType(FastNoiseLite::FractalType_FBm);
         noise.SetFractalOctaves(5);
-        noise.SetFrequency(0.02f); // Frequency 0.02 for coordinates scaled by R (feature size ~50km)
+        // Dynamic Frequency: 10 cycles per planet radius (approx 20 feature blobs around equator)
+        noise.SetFrequency(4.0f / params.R);
 
         for (auto& hm : z0) hm.resize(N, std::vector<double>(N, 0.0));
         for (auto& hm : u) hm.resize(N, std::vector<double>(N, 0.0));
@@ -97,8 +98,9 @@ public:
     // Generate initial heightmaps and uplift maps
     void generateInitialMaps() {
         double scale = params.R; // Scale coordinates by planet radius (km)
-        double amplitude_z0 = 25.0 * (params.T / 100.0); // Initial height variation (km) - Increased for more rough terrain
-        double amplitude_u = 10.0 * (params.T / 100.0); // Uplift scaled by lithosphere thickness
+        // Dynamic Amplitude: Scale height with radius to maintain "toy planet" proportions
+        double amplitude_z0 = params.R * 0.15; // 15% of radius (e.g., 15km for R=100)
+        double amplitude_u = params.R * 0.05;  // 5% uplift base
         for (int face = 0; face < 6; ++face) {
             for (int i = 0; i < N; ++i) {
                 double s = -1.0 + 2.0 * i / (N - 1);
@@ -399,7 +401,7 @@ public:
 int main() {
     setlocale(LC_NUMERIC, "French_Canada.1252");
     try {
-        PlanetParams params = {9.81, 200.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
+        PlanetParams params = {9.81, 100.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
         PlanetaryLandscape planet(params);
         planet.generateHeightmaps();
         
