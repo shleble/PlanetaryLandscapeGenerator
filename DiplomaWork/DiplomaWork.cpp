@@ -56,14 +56,18 @@ private:
     openvdb::FloatGrid::Ptr grid;
     PlanetParams params;
     static const int N = 256; // Resolution per face
+    std::array<Heightmap, 6> biomes;
     std::array<Heightmap, 6> z0;        // Initial heightmaps
     std::array<Heightmap, 6> u;         // Uplift maps
     std::array<Heightmap, 6> heightmaps; // Final eroded heightmaps
     FastNoiseLite noise;
+    FastNoiseLite biomeNoise;
+    FastNoiseLite caveNoise;
     std::mt19937 rng; // Seeded RNG
 
 public:
     const openvdb::FloatGrid::Ptr& getGrid() const { return grid; }
+    const std::array<Heightmap, 6>& getBiomes() const { return biomes; }
     const std::array<Heightmap, 6>& getHeightmaps() const { return heightmaps; }
     static int getResolution() { return N; }
     PlanetaryLandscape(PlanetParams p) : params(p), rng(p.S) {
@@ -78,6 +82,21 @@ public:
         // Dynamic Frequency: 10 cycles per planet radius (approx 20 feature blobs around equator)
         noise.SetFrequency(4.0f / params.R);
 
+        // Setup Biome Noise
+        biomeNoise.SetSeed(params.S + 1); // Different seed
+        biomeNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+        biomeNoise.SetFrequency(1.0f / params.R);
+        biomeNoise.SetFractalType(FastNoiseLite::FractalType_FBm);
+        biomeNoise.SetFractalOctaves(3);
+
+        // Setup Cave Noise
+        caveNoise.SetSeed(params.S + 2);
+        caveNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+        caveNoise.SetFrequency(8.0f / params.R);
+        caveNoise.SetFractalType(FastNoiseLite::FractalType_Ridged);
+        caveNoise.SetFractalOctaves(2);
+
+        for (auto& hm : biomes) hm.resize(N, std::vector<double>(N, 0.0));
         for (auto& hm : z0) hm.resize(N, std::vector<double>(N, 0.0));
         for (auto& hm : u) hm.resize(N, std::vector<double>(N, 0.0));
         for (auto& hm : heightmaps) hm.resize(N, std::vector<double>(N, 0.0));
@@ -99,9 +118,7 @@ public:
     // Generate initial heightmaps and uplift maps
     void generateInitialMaps() {
         double scale = params.R; // Scale coordinates by planet radius (km)
-        // Dynamic Amplitude: Scale height with radius to maintain "toy planet" proportions
-        double amplitude_z0 = params.R * 0.15; // 15% of radius (e.g., 15km for R=100)
-        double amplitude_u = params.R * 0.05;  // 5% uplift base
+
         for (int face = 0; face < 6; ++face) {
             for (int i = 0; i < N; ++i) {
                 double s = -1.0 + 2.0 * i / (N - 1);
@@ -109,16 +126,45 @@ public:
                     double t = -1.0 + 2.0 * j / (N - 1);
                     Vec3 D = get_direction(face, s, t);
                     
-                    // Use scaled coordinates with offset
+                    // 1. Sample Biome Data
+                    double biomeVal = biomeNoise.GetNoise(D.x * scale, D.y * scale, D.z * scale);
+                    biomes[face][i][j] = biomeVal;
+                    
+                    // 2. Define Biome Modifiers
+                    double z0_mult = 1.0;
+                    double u_mult = 1.0;
+                    double base_offset = 0.0;
+                    
+                    if (biomeVal < -0.2) { 
+                        // OCEAN / BASIN
+                        z0_mult = 0.3;
+                        u_mult = 0.0;
+                        base_offset = -params.R * 0.05;
+                    } else if (biomeVal > 0.4) {
+                        // MOUNTAINS
+                        z0_mult = 1.2;
+                        u_mult = 0.7;
+                        base_offset = params.R * 0.08;
+                    } else {
+                        // PLAINS / HILLS
+                        z0_mult = 0.8;
+                        u_mult = 0.2;
+                        base_offset = 0.0;
+                    }
+
+                    double noiseVal = noise.GetNoise(D.x * scale, D.y * scale, D.z * scale);
+
+                    double baseline_amp = params.R * 0.15;
+
+                    z0[face][i][j] = (noiseVal * baseline_amp * z0_mult) + base_offset;
+
                     double x = D.x * scale;
                     double y = D.y * scale;
                     double z = D.z * scale;
-
-                    z0[face][i][j] = noise.GetNoise(x, y, z) * amplitude_z0;
-                    
-                    // For uplift, use a different offset and remap to 0..1 to avoid large flat 0 areas
                     double u_noise = noise.GetNoise(x + 2000.0, y + 2000.0, z + 2000.0);
-                    u[face][i][j] = (u_noise * 0.5 + 0.5) * amplitude_u; 
+                    double baseline_uplift = params.R * 0.05;
+                    u[face][i][j] = (u_noise * 0.5 + 0.5) * baseline_uplift * u_mult;
+
                 }
             }
         }
@@ -295,11 +341,30 @@ public:
                     double r = std::sqrt(x * x + y * y + z * z);
                     if (r > 0 && r <= params.R * 1.1) {
                         Vec3 D = normalize(Vec3(x, y, z));
-                        auto [face, s, t] = get_face_and_st(D);
-                        double u = (s + 1.0) / 2.0 * (N - 1);
-                        double v = (t + 1.0) / 2.0 * (N - 1);
-                        double h = interpolate(heightmaps[face], u, v);
+                        double warpX = caveNoise.GetNoise((double)x * 0.5, (double)y * 0.5, (double)z);
+                        double warpY = caveNoise.GetNoise((double)y * 0.5, (double)z * 0.5, (double)x);
+                        double warpStrength = 15.0; // Distort by up to 15km
+
+                        Vec3 D_warped = normalize(Vec3(x + warpX * warpStrength, y + warpY * warpStrength, z));
+
+                        auto [face, s, t] = get_face_and_st(D_warped);
+                        double u_coord = (s + 1.0) / 2.0 * (N - 1);
+                        double v_coord = (t + 1.0) / 2.0 * (N - 1);
+                        double h = interpolate(heightmaps[face], u_coord, v_coord);
+
                         double s_value = r - (params.R + h);
+
+                        double terrace = std::sin((r - params.R) * 0.8) * 1.5; 
+                        s_value += terrace;
+
+                        if (s_value > -5.0 && s_value < 10.0) { // Near surface band
+                             double archVal = caveNoise.GetNoise((double)x * 1.2, (double)y * 1.2, (double)z * 1.2);
+                             if (archVal > 0.65) {
+                                 double hole_dist = (archVal - 0.65) * 20.0;
+                                 s_value = std::max(s_value, hole_dist);
+                             }
+                        }
+
                         accessor.setValue(openvdb::Coord(x, y, z), s_value);
                     }
                 }
