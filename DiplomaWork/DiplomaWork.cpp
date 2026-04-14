@@ -56,13 +56,13 @@ private:
     openvdb::FloatGrid::Ptr grid;
     PlanetParams params;
     static const int N = 256; // Resolution per face
-    std::array<Heightmap, 6> biomes;
+    std::array<Heightmap, 6> biomes;    // Initial heightmaps for biome split
     std::array<Heightmap, 6> z0;        // Initial heightmaps
     std::array<Heightmap, 6> u;         // Uplift maps
     std::array<Heightmap, 6> heightmaps; // Final eroded heightmaps
     FastNoiseLite noise;
-    FastNoiseLite biomeNoise;
-    FastNoiseLite caveNoise;
+    FastNoiseLite biomeNoise; // Separate noise for macro-biomes
+    FastNoiseLite caveNoise;  // 3D Noise for caves
     std::mt19937 rng; // Seeded RNG
 
 public:
@@ -76,21 +76,21 @@ public:
         grid = openvdb::FloatGrid::create();
         noise.SetSeed(params.S);
         noise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-        
+
         // Improve noise for planetary scale
         noise.SetFractalType(FastNoiseLite::FractalType_FBm);
         noise.SetFractalOctaves(5);
         // Dynamic Frequency: 10 cycles per planet radius (approx 20 feature blobs around equator)
         noise.SetFrequency(4.0f / params.R);
 
-        // Setup Biome Noise
+        // Setup Biome Noise (Low Frequency, Macro structures)
         biomeNoise.SetSeed(params.S + 1); // Different seed
         biomeNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
         biomeNoise.SetFrequency(1.0f / params.R);
         biomeNoise.SetFractalType(FastNoiseLite::FractalType_FBm);
         biomeNoise.SetFractalOctaves(3);
 
-        // Setup Cave Noise
+        // Setup Cave Noise (3D Volumetric)
         caveNoise.SetSeed(params.S + 2);
         caveNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
         caveNoise.SetFrequency(8.0f / params.R);
@@ -126,26 +126,26 @@ public:
                 for (int j = 0; j < N; ++j) {
                     double t = -1.0 + 2.0 * j / (N - 1);
                     Vec3 D = get_direction(face, s, t);
-                    
+
                     // 1. Sample Biome Data
                     double biomeVal = biomeNoise.GetNoise(D.x * scale, D.y * scale, D.z * scale);
                     biomes[face][i][j] = biomeVal;
-                    
+
                     // 2. Define Biome Modifiers
                     double z0_mult = 1.0;
                     double u_mult = 1.0;
                     double base_offset = 0.0;
-                    
-                    if (biomeVal < -0.2) { 
+
+                    if (biomeVal < -0.2) {
                         // OCEAN / BASIN
-                        z0_mult = 0.3;
-                        u_mult = 0.0;
-                        base_offset = -params.R * 0.05;
+                        z0_mult = 0.3;     // Smooth bottom
+                        u_mult = 0.0;      // No uplift
+                        base_offset = -params.R * 0.05; // Lower ground
                     } else if (biomeVal > 0.4) {
                         // MOUNTAINS
-                        z0_mult = 1.2;
-                        u_mult = 0.7;
-                        base_offset = params.R * 0.08;
+                        z0_mult = 1.2;     // Rugged
+                        u_mult = 0.7;      // High uplift
+                        base_offset = params.R * 0.08; // Higher ground
                     } else {
                         // PLAINS / HILLS
                         z0_mult = 0.8;
@@ -155,10 +155,12 @@ public:
 
                     double noiseVal = noise.GetNoise(D.x * scale, D.y * scale, D.z * scale);
 
+                    // 3. Apply Modifiers
                     double baseline_amp = params.R * 0.15;
 
                     z0[face][i][j] = (noiseVal * baseline_amp * z0_mult) + base_offset;
 
+                    // Uplift
                     double x = D.x * scale;
                     double y = D.y * scale;
                     double z = D.z * scale;
@@ -254,22 +256,24 @@ public:
         double m = 0.4, n = 1.0;
         double total_time = params.A / 1e9;
         double dx = 2.0 / (N - 1);
-        
+
         // Stability fix: ensure dt is small enough relative to dx
         // Target dt = 0.002 ensures stability for N=256 and likely N=512
         double target_dt = dx / 1.9;
         int iterations = static_cast<int>(std::ceil(total_time / target_dt));
         double dt = total_time / iterations;
-        
+
         std::cout << "Erosion iterations: " << iterations << ", dt: " << dt << std::endl;
-        
+
         for (int iter = 0; iter < iterations; ++iter) {
             Heightmap z_new = z;
             for (int i = 0; i < N; ++i) {
                 for (int j = 0; j < N; ++j) {
+                    // Smooth boundary filter: prevent faces from tearing at seams
+                    // Also force boundaries to remain close to z0
                     double u_dist = std::min(i, N - 1 - i) / (double)N;
                     double v_dist = std::min(j, N - 1 - j) / (double)N;
-                    double edge_blend = std::min(1.0, std::min(u_dist, v_dist) * 8.0);
+                    double edge_blend = std::min(1.0, std::min(u_dist, v_dist) * 8.0); // 0 at edges, 1.0 safely inside
 
                     Cell r = rn[i][j];
                     if (r.i != -1) {
@@ -279,6 +283,7 @@ public:
                             double max_erosion = z[i][j] - z[r.i][r.j];
                             erosion = std::min(erosion, max_erosion * 0.9);
 
+                            // Apply scaled erosion and uplift to prevent boundary tears
                             z_new[i][j] = z[i][j] + (u[face][i][j] * dt - erosion) * edge_blend;
                         } else {
                             z_new[i][j] = z[i][j] + (u[face][i][j] * dt) * edge_blend;
@@ -297,7 +302,7 @@ public:
     // Generate heightmaps with uplift and erosion
     void generateHeightmaps() {
         generateInitialMaps();
-        
+
         std::cout << "Starting Analytical Erosion..." << std::endl;
         auto start = std::chrono::high_resolution_clock::now();
         for (int face = 0; face < 6; ++face) {
@@ -338,6 +343,7 @@ public:
                (1 - fu) * fv * h01 + fu * fv * h11;
     }
 
+    // Fast base SDF estimation without 3D noise (used for narrowing iteration band)
     float estimateSDF(double x, double y, double z, double r) {
         Vec3 D = normalize(Vec3(x, y, z));
         auto [face, s, t] = get_face_and_st(D);
@@ -347,6 +353,7 @@ public:
         return static_cast<float>(r - (params.R + h));
     }
 
+    // Compute the SDF value for a single voxel at (x, y, z) with precomputed radius r
     float computeSDF(double x, double y, double z, double r) {
         Vec3 D = normalize(Vec3(x, y, z));
 
@@ -408,15 +415,26 @@ public:
 
 class PlanetaryExporter {
 public:
-    static void exportMeshChunked(PlanetaryLandscape& planet, const std::string& filename, int chunk_size = 256) {
+    // Export mesh to OBJ file using chunked processing to limit RAM usage
+    static void exportMeshChunked(PlanetaryLandscape& planet, const std::string& filename, int chunk_size = 1024, double voxel_size = -1.0) {
         const auto& params = planet.getParams();
+        
+        // Auto-scale sparsity: As the planet radius increases above 200, output fewer polygons 
+        // relatively by increasing voxel dimension size
+        if (voxel_size <= 0.0) {
+            voxel_size = std::max(1.0, params.R / 500.0);
+        }
+
         int R_max = static_cast<int>(params.R * 1.5 + 0.5);
+        double phys_chunk_size = chunk_size * voxel_size;
 
         std::ofstream outfile(filename);
         if (!outfile.is_open()) {
             std::cerr << "Cannot open file: " << filename << std::endl;
             return;
         }
+        // Collect all vertices first and then faces
+        // Write vertices to a temp file, faces to another temp file, then concatenate
 
         std::string verts_file = filename + ".verts.tmp";
         std::string faces_file = filename + ".faces.tmp";
@@ -430,37 +448,54 @@ public:
 
         size_t vertex_offset = 0; // Running vertex index offset across chunks
         int total_chunks = 0;
-        int x_min = -R_max;
-        int x_max = R_max;
+        double x_min = -R_max;
+        double x_max = R_max;
 
-        float extract_band = 40.0f;
-        float eval_band = 80.0f;
+        // Band parameters scaled securely relative to voxel_size
+        float extract_band = 10.0f + 25.0f * voxel_size;
+        float eval_band = 100.0f + 50.0f * voxel_size;
 
-        for (int chunk_start = x_min; chunk_start <= x_max; chunk_start += chunk_size) {
-            int chunk_end = std::min(chunk_start + chunk_size - 1, x_max);
+        for (double chunk_start = x_min; chunk_start <= x_max; chunk_start += phys_chunk_size) {
+            double chunk_end = std::min(chunk_start + phys_chunk_size, x_max);
             total_chunks++;
 
             std::cout << "  Chunk " << total_chunks << ": x=[" << chunk_start << ".." << chunk_end << "]" << std::flush;
 
+            // Build a temporary grid for this slab
             openvdb::FloatGrid::Ptr chunk_grid = openvdb::FloatGrid::create(extract_band);
             chunk_grid->setGridClass(openvdb::GRID_LEVEL_SET);
+            // Apply scale transform so exporting directly outputs into Physical world coordinates
+            chunk_grid->setTransform(openvdb::math::Transform::createLinearTransform(voxel_size));
             openvdb::FloatGrid::Accessor accessor = chunk_grid->getAccessor();
 
-            int pad = 3;
-            for (int x = chunk_start - pad; x <= chunk_end + pad; ++x) {
-                for (int y = -R_max; y <= R_max; ++y) {
-                    for (int z = -R_max; z <= R_max; ++z) {
-                        double r = std::sqrt((double)x * x + (double)y * y + (double)z * z);
+            // Populate SDF for this X-slab with padding
+            // Marching cubes needs neighboring voxels to interpolate edge crossings
+            int pad_idx = 5;
+            int start_idx = std::floor(chunk_start / voxel_size);
+            int end_idx = std::ceil(chunk_end / voxel_size);
+            int yz_max_idx = std::ceil(R_max / voxel_size);
+
+            for (int i = start_idx - pad_idx; i <= end_idx + pad_idx; ++i) {
+                for (int j = -yz_max_idx; j <= yz_max_idx; ++j) {
+                    for (int k = -yz_max_idx; k <= yz_max_idx; ++k) {
+                        double x = i * voxel_size;
+                        double y = j * voxel_size;
+                        double z = k * voxel_size;
+
+                        double r = std::sqrt(x * x + y * y + z * z);
                         if (r > 0 && r <= params.R * 1.5) {
                             float est_sdf = planet.estimateSDF(x, y, z, r);
 
+                            // Only perform 3D noise computation if near the estimated surface
                             if (std::abs(est_sdf) < eval_band) {
                                 float sdf = planet.computeSDF(x, y, z, r);
 
                                 if (std::abs(sdf) < extract_band) {
-                                    accessor.setValue(openvdb::Coord(x, y, z), sdf);
+                                    // Store active values near surface
+                                    accessor.setValue(openvdb::Coord(i, j, k), sdf);
                                 } else if (sdf <= -extract_band) {
-                                    accessor.setValueOff(openvdb::Coord(x, y, z), -extract_band);
+                                    // prevent false zero-crossings right beneath the surface.
+                                    accessor.setValueOff(openvdb::Coord(i, j, k), -extract_band);
                                 }
                             }
                         }
@@ -468,19 +503,22 @@ public:
                 }
             }
 
+            // Mesh this chunk
             openvdb::tools::VolumeToMesh mesher(0.0, 0.0);
             mesher(*chunk_grid);
 
             size_t num_points = mesher.pointListSize();
             const auto& points = mesher.pointList();
 
+            // Write ALL vertices from this chunk
             for (size_t i = 0; i < num_points; ++i) {
                 const auto& p = points.get()[i];
                 verts_out << "v " << p[0] << " " << p[1] << " " << p[2] << "\n";
             }
 
-            double x_lo = (double)chunk_start - 0.5;  // half-voxel tolerance
-            double x_hi = (double)chunk_end + 0.5;
+            // Write faces, but ONLY those whose centroid X falls within
+            double x_lo = chunk_start;
+            double x_hi = chunk_end;
 
             const auto& polygons = mesher.polygonPoolList();
             for (int i = 0; i < mesher.polygonPoolListSize(); ++i) {
@@ -488,6 +526,7 @@ public:
 
                 for (size_t j = 0; j < pool.numTriangles(); ++j) {
                     const auto& tri = pool.triangle(j);
+                    // Compute centroid X of this triangle
                     double cx = (points.get()[tri[0]][0] + points.get()[tri[1]][0] + points.get()[tri[2]][0]) / 3.0;
 
                     if (cx >= x_lo && cx < x_hi) {
@@ -520,11 +559,13 @@ public:
 
             std::cout << " -> " << num_points << " verts (total: " << vertex_offset << ")" << std::endl;
 
+            // chunk_grid goes out of scope here and is freed
         }
 
         verts_out.close();
         faces_out.close();
 
+        // Concatenate: vertices first, then faces
         std::cout << "Merging " << total_chunks << " chunks into " << filename << "..." << std::endl;
 
         {
@@ -538,6 +579,7 @@ public:
 
         outfile.close();
 
+        // Clean up temp files
         std::remove(verts_file.c_str());
         std::remove(faces_file.c_str());
 
