@@ -63,6 +63,7 @@ private:
     FastNoiseLite noise;
     FastNoiseLite biomeNoise; // Separate noise for macro-biomes
     FastNoiseLite caveNoise;  // 3D Noise for caves
+    FastNoiseLite archNoise;  // 3D Noise for arches
     std::mt19937 rng; // Seeded RNG
 
 public:
@@ -96,6 +97,12 @@ public:
         caveNoise.SetFrequency(8.0f / params.R);
         caveNoise.SetFractalType(FastNoiseLite::FractalType_Ridged);
         caveNoise.SetFractalOctaves(2);
+
+        archNoise.SetSeed(params.S + 3);
+        archNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+        archNoise.SetFrequency(4.0f / params.R);
+        archNoise.SetFractalType(FastNoiseLite::FractalType_FBm);
+        archNoise.SetFractalOctaves(2);
 
         for (auto& hm : biomes) hm.resize(N, std::vector<double>(N, 0.0));
         for (auto& hm : z0) hm.resize(N, std::vector<double>(N, 0.0));
@@ -167,10 +174,51 @@ public:
                     double u_noise = noise.GetNoise(x + 2000.0, y + 2000.0, z + 2000.0);
                     double baseline_uplift = params.R * 0.05;
                     u[face][i][j] = (u_noise * 0.5 + 0.5) * baseline_uplift * u_mult;
-
                 }
             }
         }
+    }
+
+    // Planchon-Darboux depression filling
+    Heightmap fillDepressions(const Heightmap& z) const {
+        Heightmap W(N, std::vector<double>(N, 1e9));
+        using Element = std::tuple<double, int, int>;
+        std::priority_queue<Element, std::vector<Element>, std::greater<Element>> pq;
+
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j < N; ++j) {
+                if (i == 0 || i == N - 1 || j == 0 || j == N - 1) {
+                    W[i][j] = z[i][j];
+                    pq.push({W[i][j], i, j});
+                }
+            }
+        }
+
+        double epsilon = 1e-5;
+
+        while (!pq.empty()) {
+            auto [w, i, j] = pq.top();
+            pq.pop();
+
+            if (w > W[i][j]) continue;
+
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    if (di == 0 && dj == 0) continue;
+                    int ni = i + di;
+                    int nj = j + dj;
+
+                    if (ni >= 0 && ni < N && nj >= 0 && nj < N) {
+                        double new_w = std::max(z[ni][nj], W[i][j] + epsilon);
+                        if (new_w < W[ni][nj]) {
+                            W[ni][nj] = new_w;
+                            pq.push({new_w, ni, nj});
+                        }
+                    }
+                }
+            }
+        }
+        return W;
     }
 
     // Compute river network for a face
@@ -244,7 +292,8 @@ public:
             }
             return;
         }
-        auto rn = computeRiverNetwork(z, face);
+        Heightmap W = fillDepressions(z);
+        auto rn = computeRiverNetwork(W, face);
         auto A = computeDrainageArea(rn);
         double temperature_factor = 1.0;
         if (params.T_min < 0.0 && params.T_max > 0.0) {
@@ -269,12 +318,6 @@ public:
             Heightmap z_new = z;
             for (int i = 0; i < N; ++i) {
                 for (int j = 0; j < N; ++j) {
-                    // Smooth boundary filter: prevent faces from tearing at seams
-                    // Also force boundaries to remain close to z0
-                    double u_dist = std::min(i, N - 1 - i) / (double)N;
-                    double v_dist = std::min(j, N - 1 - j) / (double)N;
-                    double edge_blend = std::min(1.0, std::min(u_dist, v_dist) * 8.0); // 0 at edges, 1.0 safely inside
-
                     Cell r = rn[i][j];
                     if (r.i != -1) {
                         double slope = (z[i][j] - z[r.i][r.j]) / dx;
@@ -283,18 +326,18 @@ public:
                             double max_erosion = z[i][j] - z[r.i][r.j];
                             erosion = std::min(erosion, max_erosion * 0.9);
 
-                            // Apply scaled erosion and uplift to prevent boundary tears
-                            z_new[i][j] = z[i][j] + (u[face][i][j] * dt - erosion) * edge_blend;
+                            z_new[i][j] = z[i][j] + (u[face][i][j] * dt - erosion);
                         } else {
-                            z_new[i][j] = z[i][j] + (u[face][i][j] * dt) * edge_blend;
+                            z_new[i][j] = z[i][j] + (u[face][i][j] * dt);
                         }
                     } else {
-                        z_new[i][j] = z[i][j] + (u[face][i][j] * dt) * edge_blend;
+                        z_new[i][j] = z[i][j] + (u[face][i][j] * dt);
                     }
                 }
             }
             z = z_new;
-            rn = computeRiverNetwork(z, face);
+            Heightmap W = fillDepressions(z);
+            rn = computeRiverNetwork(W, face);
             A = computeDrainageArea(rn);
         }
     }
@@ -329,64 +372,96 @@ public:
         return {face, s, t};
     }
 
-    double interpolate(const Heightmap& hm, double u, double v) {
+    double interpolate(const Heightmap& hm, double u, double v) const {
         int i0 = std::floor(u), j0 = std::floor(v);
         int i1 = i0 + 1, j1 = j0 + 1;
-        if (i0 < 0) i0 = 0;
-        if (j0 < 0) j0 = 0;
-        if (i1 >= N) i1 = N - 1;
-        if (j1 >= N) j1 = N - 1;
         double fu = u - i0, fv = v - j0;
+        i0 = std::max(0, std::min(N - 1, i0));
+        j0 = std::max(0, std::min(N - 1, j0));
+        i1 = std::max(0, std::min(N - 1, i1));
+        j1 = std::max(0, std::min(N - 1, j1));
+
         double h00 = hm[i0][j0], h10 = hm[i1][j0];
         double h01 = hm[i0][j1], h11 = hm[i1][j1];
         return (1 - fu) * (1 - fv) * h00 + fu * (1 - fv) * h10 +
                (1 - fu) * fv * h01 + fu * fv * h11;
     }
 
-    // Fast base SDF estimation without 3D noise (used for narrowing iteration band)
-    float estimateSDF(double x, double y, double z, double r) {
+    // Blend physics heights across adjacent cubemap faces
+    double get_blended_height(const Vec3& D) const {
+        double abs_D[3] = {std::abs(D.x), std::abs(D.y), std::abs(D.z)};
+        double coords[3] = {D.x, D.y, D.z};
+
+        double blend_power = 6.0;
+        double w[3] = {
+                std::pow(abs_D[0], blend_power),
+                std::pow(abs_D[1], blend_power),
+                std::pow(abs_D[2], blend_power)
+        };
+        double total_w = w[0] + w[1] + w[2];
+        w[0] /= total_w;
+        w[1] /= total_w;
+        w[2] /= total_w;
+
+        double h = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            if (w[k] > 0.001) {
+                int sign = coords[k] > 0 ? 1 : -1;
+                int face = k * 2 + (sign < 0 ? 1 : 0);
+                int m = (k + 1) % 3;
+                int n = (k + 2) % 3;
+
+                double s = (coords[k] != 0.0) ? (coords[m] / coords[k]) : 0.0;
+                double t = (coords[k] != 0.0) ? (coords[n] / coords[k]) : 0.0;
+
+                double u_coord = (s + 1.0) / 2.0 * (N - 1);
+                double v_coord = (t + 1.0) / 2.0 * (N - 1);
+                h += w[k] * interpolate(heightmaps[face], u_coord, v_coord);
+            }
+        }
+        return h;
+    }
+
+
+    // Fast base SDF estimation without 3D noise
+    float estimateSDF(double x, double y, double z, double r) const {
         Vec3 D = normalize(Vec3(x, y, z));
-        auto [face, s, t] = get_face_and_st(D);
-        double u_coord = (s + 1.0) / 2.0 * (N - 1);
-        double v_coord = (t + 1.0) / 2.0 * (N - 1);
-        double h = interpolate(heightmaps[face], u_coord, v_coord);
+        double h = get_blended_height(D);
         return static_cast<float>(r - (params.R + h));
     }
 
     // Compute the SDF value for a single voxel at (x, y, z) with precomputed radius r
-    float computeSDF(double x, double y, double z, double r) {
+    float computeSDF(double x, double y, double z, double r) const {
         Vec3 D = normalize(Vec3(x, y, z));
 
-
-        // 1. Domain Warping (Overhangs)
-        double warpX = caveNoise.GetNoise((double)x * 0.5, (double)y * 0.5, (double)z);
-        double warpY = caveNoise.GetNoise((double)y * 0.5, (double)z * 0.5, (double)x);
-        double warpStrength = 15.0;
-
-        Vec3 D_warped = normalize(Vec3(x + warpX * warpStrength, y + warpY * warpStrength, z));
-
-        // 2. Sample Heightmap with Warped Coordinates
-        auto [face, s, t] = get_face_and_st(D_warped);
-        double u_coord = (s + 1.0) / 2.0 * (N - 1);
-        double v_coord = (t + 1.0) / 2.0 * (N - 1);
-        double h = interpolate(heightmaps[face], u_coord, v_coord);
-
-        // Base SDF
+        // 1. Evaluate Pure Topography
+        double h = get_blended_height(D);
         double s_value = r - (params.R + h);
 
-        // 3. Terracing (Stratification)
+        // 2. Terracing
         double terrace = std::sin((r - params.R) * 0.8) * 1.5;
         s_value += terrace;
 
-        // 4. Arches (Surface Breaching Caves)
-//        if (s_value > -5.0 && s_value < 10.0) {
-//             double archVal = caveNoise.GetNoise((double)x * 1.2, (double)y * 1.2, (double)z * 1.2);
-//             if (archVal > 0.65) {
-//                 double hole_dist = (archVal - 0.65) * 20.0;
-//                 s_value = std::max(s_value, hole_dist);
-//             }
-//        }
+        // 3. Spaced-out Volumetric Overhangs & Outcroppings
+        double a_noise = archNoise.GetNoise((double)x, (double)y, (double)z);
+        
+        if (a_noise > 0.3) {
+            double outcropping_intensity = (a_noise - 0.3) * 2.0; 
+            double distance_from_surface = std::abs(s_value);
+            double density_mask = std::clamp(1.0 - (distance_from_surface / 50.0), 0.0, 1.0);
 
+            double rock_shape = std::abs(caveNoise.GetNoise((double)x * 1.5, (double)y * 1.5, (double)z * 1.5));
+            s_value -= rock_shape * outcropping_intensity * 30.0 * density_mask;
+        }
+
+        // 4. Sweeping Caverns & Arches (Swiss Cheese Boolean Subtraction)
+        if (s_value > -100.0 && s_value < 20.0 && a_noise > 0.5) {
+            // Because outcroppings form where a_noise > 0.3, a cavern forming exactly where 
+            // it peaks (a_noise > 0.5) will effortlessly hollow out the center of the 
+            // mathematical outcropping we just generated, producing a perfect organic Arch!
+            double void_dist = (a_noise - 0.5) * 120.0;
+            s_value = std::max(s_value, void_dist);
+        }
 
         return static_cast<float>(s_value);
     }
@@ -418,9 +493,8 @@ public:
     // Export mesh to OBJ file using chunked processing to limit RAM usage
     static void exportMeshChunked(PlanetaryLandscape& planet, const std::string& filename, int chunk_size = 1024, double voxel_size = -1.0) {
         const auto& params = planet.getParams();
-        
-        // Auto-scale sparsity: As the planet radius increases above 200, output fewer polygons 
-        // relatively by increasing voxel dimension size
+
+        // Auto-scale sparsity
         if (voxel_size <= 0.0) {
             voxel_size = std::max(1.0, params.R / 500.0);
         }
@@ -640,7 +714,7 @@ int main() {
     try {
         auto total_start = std::chrono::high_resolution_clock::now();
 
-        PlanetParams params = {9.81, 2000.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
+        PlanetParams params = {9.81, 300.0, 100.0,  true, 4.5e9, 12345678, -30.0, 30.0};
         PlanetaryLandscape planet(params);
         planet.generateHeightmaps();
 
