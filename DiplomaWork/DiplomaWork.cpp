@@ -455,11 +455,17 @@ public:
         }
 
         // 4. Sweeping Caverns & Arches (Swiss Cheese Boolean Subtraction)
-        if (s_value > -100.0 && s_value < 20.0 && a_noise > 0.5) {
+        if (s_value > -20.0 && s_value < 40.0 && a_noise > 0.5) {
             // Because outcroppings form where a_noise > 0.3, a cavern forming exactly where 
             // it peaks (a_noise > 0.5) will effortlessly hollow out the center of the 
             // mathematical outcropping we just generated, producing a perfect organic Arch!
+            
             double void_dist = (a_noise - 0.5) * 120.0;
+            if (s_value < 0.0) {
+                 double fade = 1.0 - (s_value / -20.0);
+                 void_dist *= std::clamp(fade, 0.0, 1.0);
+            }
+            
             s_value = std::max(s_value, void_dist);
         }
 
