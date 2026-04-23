@@ -10,6 +10,7 @@
 #include <random>
 #include <fstream>
 #include <chrono> // For timing
+#include <future>
 
 // Vector structure for 3D coordinates
 struct Vec3 {
@@ -222,7 +223,7 @@ public:
     }
 
     // Compute river network for a face
-    std::vector<std::vector<Cell>> computeRiverNetwork(const Heightmap& z, int face) {
+    std::vector<std::vector<Cell>> computeRiverNetwork(const Heightmap& z, int face, std::mt19937& local_rng) {
         std::vector<std::vector<Cell>> receivers(N, std::vector<Cell>(N, Cell(-1, -1)));
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
@@ -245,7 +246,7 @@ public:
                 }
                 if (!candidates.empty()) {
                     std::uniform_int_distribution<int> dist(0, candidates.size() - 1);
-                    receivers[i][j] = candidates[dist(rng)];
+                    receivers[i][j] = candidates[dist(local_rng)];
                 }
             }
         }
@@ -281,6 +282,7 @@ public:
 
     // Simplified analytical erosion
     void applyAnalyticalErosion(int face) {
+        std::mt19937 local_rng(params.S + face);
         Heightmap& z = heightmaps[face];
         z = z0[face];
         if (!params.W) {
@@ -293,7 +295,7 @@ public:
             return;
         }
         Heightmap W = fillDepressions(z);
-        auto rn = computeRiverNetwork(W, face);
+        auto rn = computeRiverNetwork(W, face, local_rng);
         auto A = computeDrainageArea(rn);
         double temperature_factor = 1.0;
         if (params.T_min < 0.0 && params.T_max > 0.0) {
@@ -336,8 +338,8 @@ public:
                 }
             }
             z = z_new;
-            Heightmap W = fillDepressions(z);
-            rn = computeRiverNetwork(W, face);
+            Heightmap W_new = fillDepressions(z);
+            rn = computeRiverNetwork(W_new, face, local_rng);
             A = computeDrainageArea(rn);
         }
     }
@@ -346,11 +348,20 @@ public:
     void generateHeightmaps() {
         generateInitialMaps();
 
-        std::cout << "Starting Analytical Erosion..." << std::endl;
+        std::cout << "Starting Analytical Erosion (Multithreaded)..." << std::endl;
         auto start = std::chrono::high_resolution_clock::now();
+        
+        std::vector<std::future<void>> futures;
         for (int face = 0; face < 6; ++face) {
-            applyAnalyticalErosion(face);
+            futures.push_back(std::async(std::launch::async, [this, face]() {
+                this->applyAnalyticalErosion(face);
+            }));
         }
+        
+        for (auto& f : futures) {
+            f.get();
+        }
+        
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         std::cout << "Analysis Erosion completed in: " << elapsed.count() << " seconds." << std::endl;
@@ -546,41 +557,66 @@ public:
             chunk_grid->setGridClass(openvdb::GRID_LEVEL_SET);
             // Apply scale transform so exporting directly outputs into Physical world coordinates
             chunk_grid->setTransform(openvdb::math::Transform::createLinearTransform(voxel_size));
-            openvdb::FloatGrid::Accessor accessor = chunk_grid->getAccessor();
-
             // Populate SDF for this X-slab with padding
-            // Marching cubes needs neighboring voxels to interpolate edge crossings
             int pad_idx = 5;
             int start_idx = std::floor(chunk_start / voxel_size);
             int end_idx = std::ceil(chunk_end / voxel_size);
             int yz_max_idx = std::ceil(R_max / voxel_size);
 
-            for (int i = start_idx - pad_idx; i <= end_idx + pad_idx; ++i) {
-                for (int j = -yz_max_idx; j <= yz_max_idx; ++j) {
-                    for (int k = -yz_max_idx; k <= yz_max_idx; ++k) {
-                        double x = i * voxel_size;
-                        double y = j * voxel_size;
-                        double z = k * voxel_size;
+            int i_min = start_idx - pad_idx;
+            int i_max = end_idx + pad_idx;
+            int total_i = i_max - i_min + 1;
 
-                        double r = std::sqrt(x * x + y * y + z * z);
-                        if (r > 0 && r <= params.R * 1.5) {
-                            float est_sdf = planet.estimateSDF(x, y, z, r);
+            unsigned int num_threads = std::thread::hardware_concurrency();
+            if (num_threads == 0) num_threads = 4;
 
-                            // Only perform 3D noise computation if near the estimated surface
-                            if (std::abs(est_sdf) < eval_band) {
-                                float sdf = planet.computeSDF(x, y, z, r);
+            std::vector<std::future<openvdb::FloatGrid::Ptr>> grid_futures;
+            int block_size = (total_i + num_threads - 1) / num_threads;
 
-                                if (std::abs(sdf) < extract_band) {
-                                    // Store active values near surface
-                                    accessor.setValue(openvdb::Coord(i, j, k), sdf);
-                                } else if (sdf <= -extract_band) {
-                                    // prevent false zero-crossings right beneath the surface.
-                                    accessor.setValueOff(openvdb::Coord(i, j, k), -extract_band);
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                int thread_i_start = i_min + t * block_size;
+                int thread_i_end = std::min(i_max, thread_i_start + block_size - 1);
+                
+                if (thread_i_start > i_max) break;
+
+                grid_futures.push_back(std::async(std::launch::async, [thread_i_start, thread_i_end, yz_max_idx, voxel_size, &planet, &params, eval_band, extract_band]() {
+                    openvdb::FloatGrid::Ptr local_grid = openvdb::FloatGrid::create(extract_band);
+                    local_grid->setGridClass(openvdb::GRID_LEVEL_SET);
+                    local_grid->setTransform(openvdb::math::Transform::createLinearTransform(voxel_size));
+                    openvdb::FloatGrid::Accessor local_accessor = local_grid->getAccessor();
+
+                    for (int i = thread_i_start; i <= thread_i_end; ++i) {
+                        for (int j = -yz_max_idx; j <= yz_max_idx; ++j) {
+                            for (int k = -yz_max_idx; k <= yz_max_idx; ++k) {
+                                double x = i * voxel_size;
+                                double y = j * voxel_size;
+                                double z = k * voxel_size;
+
+                                double r = std::sqrt(x * x + y * y + z * z);
+                                if (r > 0 && r <= params.R * 1.5) {
+                                    float est_sdf = planet.estimateSDF(x, y, z, r);
+
+                                    if (std::abs(est_sdf) < eval_band) {
+                                        float sdf = planet.computeSDF(x, y, z, r);
+
+                                        if (std::abs(sdf) < extract_band) {
+                                            local_accessor.setValue(openvdb::Coord(i, j, k), sdf);
+                                        } else if (sdf <= -extract_band) {
+                                            local_accessor.setValueOff(openvdb::Coord(i, j, k), -extract_band);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                    return local_grid;
+                }));
+            }
+
+            // Merge all thread-local grids into the main chunk grid
+            for (auto& fut : grid_futures) {
+                openvdb::FloatGrid::Ptr local_grid = fut.get();
+                chunk_grid->tree().merge(local_grid->tree());
             }
 
             // Mesh this chunk
