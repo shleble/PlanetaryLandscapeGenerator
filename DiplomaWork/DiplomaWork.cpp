@@ -449,8 +449,10 @@ public:
         double h = get_blended_height(D);
         double s_value = r - (params.R + h);
 
+        double feature_scale = params.R / 4000.0;
+
         // 2. Terracing
-        double terrace = std::sin((r - params.R) * 0.8) * 1.5;
+        double terrace = std::sin((r - params.R) * (0.8 / feature_scale)) * (1.5 * feature_scale);
         s_value += terrace;
 
         // 3. Spaced-out Volumetric Overhangs & Outcroppings
@@ -459,21 +461,18 @@ public:
         if (a_noise > 0.3) {
             double outcropping_intensity = (a_noise - 0.3) * 2.0; 
             double distance_from_surface = std::abs(s_value);
-            double density_mask = std::clamp(1.0 - (distance_from_surface / 50.0), 0.0, 1.0);
+            double density_mask = std::clamp(1.0 - (distance_from_surface / (50.0 * feature_scale)), 0.0, 1.0);
 
             double rock_shape = std::abs(caveNoise.GetNoise((double)x * 1.5, (double)y * 1.5, (double)z * 1.5));
-            s_value -= rock_shape * outcropping_intensity * 30.0 * density_mask;
+            s_value -= rock_shape * outcropping_intensity * (30.0 * feature_scale) * density_mask;
         }
 
         // 4. Sweeping Caverns & Arches (Swiss Cheese Boolean Subtraction)
-        if (s_value > -20.0 && s_value < 40.0 && a_noise > 0.5) {
-            // Because outcroppings form where a_noise > 0.3, a cavern forming exactly where 
-            // it peaks (a_noise > 0.5) will effortlessly hollow out the center of the 
-            // mathematical outcropping we just generated, producing a perfect organic Arch!
+        if (s_value > (-20.0 * feature_scale) && s_value < (40.0 * feature_scale) && a_noise > 0.5) {
             
-            double void_dist = (a_noise - 0.5) * 120.0;
+            double void_dist = (a_noise - 0.5) * (120.0 * feature_scale);
             if (s_value < 0.0) {
-                 double fade = 1.0 - (s_value / -20.0);
+                 double fade = 1.0 - (s_value / (-20.0 * feature_scale));
                  void_dist *= std::clamp(fade, 0.0, 1.0);
             }
             
