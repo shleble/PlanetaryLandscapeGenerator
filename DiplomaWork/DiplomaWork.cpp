@@ -127,6 +127,9 @@ public:
     // Generate initial heightmaps and uplift maps
     void generateInitialMaps() {
         double scale = params.R; // Scale coordinates by planet radius (km)
+        double T_ref = 100.0; // Reference lithosphere thickness (km), Earth-like
+        double tectonic_factor = T_ref / params.T;
+        double roughness_factor = 0.7 + 0.3 * tectonic_factor;
 
         for (int face = 0; face < 6; ++face) {
             for (int i = 0; i < N; ++i) {
@@ -164,7 +167,7 @@ public:
                     double noiseVal = noise.GetNoise(D.x * scale, D.y * scale, D.z * scale);
 
                     // 3. Apply Modifiers
-                    double baseline_amp = params.R * 0.15;
+                    double baseline_amp = params.R * 0.15 * roughness_factor;
 
                     z0[face][i][j] = (noiseVal * baseline_amp * z0_mult) + base_offset;
 
@@ -173,7 +176,7 @@ public:
                     double y = D.y * scale;
                     double z = D.z * scale;
                     double u_noise = noise.GetNoise(x + 2000.0, y + 2000.0, z + 2000.0);
-                    double baseline_uplift = params.R * 0.05;
+                    double baseline_uplift = params.R * 0.05 * tectonic_factor;
                     u[face][i][j] = (u_noise * 0.5 + 0.5) * baseline_uplift * u_mult;
                 }
             }
@@ -342,6 +345,15 @@ public:
             rn = computeRiverNetwork(W_new, face, local_rng);
             A = computeDrainageArea(rn);
         }
+
+        double max_supported_height = params.T * 0.15 * (9.81 / params.g);
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j < N; ++j) {
+                if (z[i][j] > max_supported_height) {
+                    z[i][j] = max_supported_height;
+                }
+            }
+        }
     }
 
     // Generate heightmaps with uplift and erosion
@@ -450,6 +462,8 @@ public:
         double s_value = r - (params.R + h);
 
         double feature_scale = params.R / 4000.0;
+        double T_ref = 100.0; // Reference lithosphere thickness (km)
+        double litho_factor = params.T / T_ref; // Thicker lithosphere → deeper features
 
         // 2. Terracing
         double terrace = std::sin((r - params.R) * (0.8 / feature_scale)) * (1.5 * feature_scale);
@@ -461,18 +475,21 @@ public:
         if (a_noise > 0.3) {
             double outcropping_intensity = (a_noise - 0.3) * 2.0; 
             double distance_from_surface = std::abs(s_value);
-            double density_mask = std::clamp(1.0 - (distance_from_surface / (50.0 * feature_scale)), 0.0, 1.0);
+            double outcrop_reach = 50.0 * feature_scale * litho_factor; // Thicker lithosphere → wider overhangs
+            double density_mask = std::clamp(1.0 - (distance_from_surface / outcrop_reach), 0.0, 1.0);
 
             double rock_shape = std::abs(caveNoise.GetNoise((double)x * 1.5, (double)y * 1.5, (double)z * 1.5));
             s_value -= rock_shape * outcropping_intensity * (30.0 * feature_scale) * density_mask;
         }
 
         // 4. Sweeping Caverns & Arches (Swiss Cheese Boolean Subtraction)
-        if (s_value > (-20.0 * feature_scale) && s_value < (40.0 * feature_scale) && a_noise > 0.5) {
+        double max_cave_depth = 20.0 * feature_scale * litho_factor;
+        double max_cave_height = 40.0 * feature_scale;
+        if (s_value > (-max_cave_depth) && s_value < max_cave_height && a_noise > 0.5) {
             
             double void_dist = (a_noise - 0.5) * (120.0 * feature_scale);
             if (s_value < 0.0) {
-                 double fade = 1.0 - (s_value / (-20.0 * feature_scale));
+                 double fade = 1.0 - (s_value / (-max_cave_depth));
                  void_dist *= std::clamp(fade, 0.0, 1.0);
             }
             
